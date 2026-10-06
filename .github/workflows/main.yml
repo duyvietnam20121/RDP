@@ -1,0 +1,264 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure RDP
+        shell: powershell
+        run: |
+          Write-Host "Configuring Remote Desktop..."
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0 `
+            -Force
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' `
+            -Value 1 `
+            -Force
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'SecurityLayer' `
+            -Value 1 `
+            -Force
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          Set-Service -Name TermService -StartupType Automatic
+          Restart-Service -Name TermService -Force
+
+          Start-Sleep -Seconds 5
+
+          $service = Get-Service -Name TermService
+
+          if ($service.Status -ne "Running") {
+              Write-Error "Remote Desktop service failed to start."
+              exit 1
+          }
+
+          Write-Host "RDP service is running."
+
+      - name: Create RDP User
+        shell: powershell
+        run: |
+          $username = "RDP"
+
+          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+              Write-Host "User already exists."
+
+              $existingUser = Get-LocalUser -Name $username
+              $existingUser | Enable-LocalUser
+          }
+          else {
+              $upper   = [char[]](65..90)
+              $lower   = [char[]](97..122)
+              $numbers = [char[]](48..57)
+              $special = [char[]](33..47)
+
+              $passwordChars = @()
+              $passwordChars += $upper   | Get-Random -Count 4
+              $passwordChars += $lower   | Get-Random -Count 4
+              $passwordChars += $numbers | Get-Random -Count 4
+              $passwordChars += $special | Get-Random -Count 4
+
+              $password = -join ($passwordChars | Sort-Object { Get-Random })
+
+              $securePassword = ConvertTo-SecureString `
+                $password `
+                -AsPlainText `
+                -Force
+
+              New-LocalUser `
+                -Name $username `
+                -Password $securePassword `
+                -AccountNeverExpires `
+                -PasswordNeverExpires `
+                -UserMayNotChangePassword
+
+              Add-LocalGroupMember `
+                -Group "Remote Desktop Users" `
+                -Member $username
+
+              Add-LocalGroupMember `
+                -Group "Administrators" `
+                -Member $username
+
+              "RDP_USERNAME=$username" >> $env:GITHUB_ENV
+              "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          }
+
+          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+              Write-Error "Failed to create RDP user."
+              exit 1
+          }
+
+          # Make sure the user is in both groups
+          $rdpGroup = Get-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -ErrorAction SilentlyContinue
+
+          if (-not ($rdpGroup.Name -match "\\$username$")) {
+              Add-LocalGroupMember `
+                -Group "Remote Desktop Users" `
+                -Member $username `
+                -ErrorAction SilentlyContinue
+          }
+
+          $adminGroup = Get-LocalGroupMember `
+            -Group "Administrators" `
+            -ErrorAction SilentlyContinue
+
+          if (-not ($adminGroup.Name -match "\\$username$")) {
+              Add-LocalGroupMember `
+                -Group "Administrators" `
+                -Member $username `
+                -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "RDP user is ready."
+
+      # Tailscale GitHub Action
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          version: latest
+
+      - name: Get Tailscale IP
+        shell: powershell
+        run: |
+          Write-Host "Getting Tailscale IPv4..."
+
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscale)) {
+              Write-Error "Tailscale executable was not found."
+              exit 1
+          }
+
+          $tsIP = $null
+
+          for ($i = 1; $i -le 30; $i++) {
+              $tsIP = (& $tailscale ip -4 2>$null |
+                  Select-Object -First 1).Trim()
+
+              if ($tsIP -and
+                  $tsIP -match '^\d{1,3}(\.\d{1,3}){3}$') {
+                  break
+              }
+
+              Write-Host "Waiting for Tailscale IP... ($i/30)"
+              Start-Sleep -Seconds 2
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Could not obtain Tailscale IPv4 address."
+              exit 1
+          }
+
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+          Write-Host "Tailscale IP: $tsIP"
+
+      - name: Verify RDP
+        shell: powershell
+        run: |
+          Write-Host "Checking RDP port 3389..."
+
+          $portReady = $false
+
+          for ($i = 1; $i -le 20; $i++) {
+              $result = Test-NetConnection `
+                -ComputerName $env:TAILSCALE_IP `
+                -Port 3389 `
+                -WarningAction SilentlyContinue
+
+              if ($result.TcpTestSucceeded) {
+                  $portReady = $true
+                  break
+              }
+
+              Write-Host "RDP not ready yet ($i/20)..."
+              Start-Sleep -Seconds 3
+          }
+
+          if (-not $portReady) {
+              Write-Error "RDP port 3389 is not reachable."
+              exit 1
+          }
+
+          Write-Host "RDP is reachable."
+
+      - name: Show RDP Information
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "             RDP READY"
+          Write-Host "======================================"
+          Write-Host "Address : $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USERNAME"
+          Write-Host "======================================"
+          Write-Host ""
+
+          if ($env:RDP_PASSWORD) {
+              Write-Host "Password was generated successfully."
+          }
+
+      - name: Keep Runner Alive
+        shell: powershell
+        run: |
+          Write-Host "RDP session is active."
+
+          # Stay below the GitHub-hosted runner maximum.
+          $endTime = (Get-Date).AddHours(5).AddMinutes(59)
+
+          while ((Get-Date) -lt $endTime) {
+
+              Write-Host ""
+              Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')]"
+              Write-Host "RDP Active"
+              Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+              # Check RDP service
+              $service = Get-Service `
+                -Name TermService `
+                -ErrorAction SilentlyContinue
+
+              if ($service -and $service.Status -ne "Running") {
+                  Write-Host "RDP service stopped. Restarting..."
+
+                  Restart-Service `
+                    -Name TermService `
+                    -Force
+
+                  Start-Sleep -Seconds 3
+              }
+
+              # Check Tailscale
+              $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+              if (Test-Path $tailscale) {
+                  $status = & $tailscale status 2>$null
+
+                  if ($LASTEXITCODE -ne 0) {
+                      Write-Host "Tailscale status check failed."
+                  }
+              }
+
+              Start-Sleep -Seconds 300
+          }
+
+          Write-Host ""
+          Write-Host "Maximum workflow runtime reached."
+          Write-Host "Ending workflow normally."
